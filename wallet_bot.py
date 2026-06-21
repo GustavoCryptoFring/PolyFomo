@@ -408,16 +408,24 @@ def get_price_history_from_trades(condition_id: str, outcome: str, first_buy_ts:
 
 
 def get_market_info(condition_id: str) -> dict:
+    if not condition_id:
+        return None
+    want = condition_id.lower()
     for param in ({"condition_ids": condition_id}, {"conditionId": condition_id}):
         try:
             r = requests.get(f"{GAMMA_API}/markets", params=param, timeout=6)
             if r.status_code != 200:
                 continue
             data = r.json()
-            if isinstance(data, list) and data:
-                return data[0]
-            if isinstance(data, dict) and data:
-                return data
+            candidates = data if isinstance(data, list) else ([data] if isinstance(data, dict) and data else [])
+            for m in candidates:
+                mcid = (m.get("conditionId") or m.get("condition_id") or "").lower()
+                # Only trust a market whose conditionId actually matches the one we asked for.
+                # Gamma can return unrelated default markets for an unknown/truncated id, and
+                # blindly taking data[0] is exactly what produced wrong links (e.g. "GTA VI").
+                # startswith handles truncated ids from /closed-positions (prefix of the real id).
+                if mcid and (mcid == want or mcid.startswith(want)):
+                    return m
         except Exception:
             pass
     return None
@@ -481,6 +489,19 @@ def get_event_url(market: dict) -> str:
                 return "https://polymarket.com/event/" + slug
     slug = market.get("slug") or ""
     return ("https://polymarket.com/event/" + slug) if slug else ""
+
+
+def build_event_url(pos, market) -> str:
+    """Build the Polymarket event URL, preferring the position's OWN slug data.
+    The position always carries the correct eventSlug/slug for the user's market,
+    whereas a Gamma lookup can fail or return a wrong market for resolved markets."""
+    event_slug = (pos.get("eventSlug") or "").strip()
+    if event_slug:
+        return "https://polymarket.com/event/" + event_slug
+    market_slug = (pos.get("slug") or "").strip()
+    if market_slug:
+        return "https://polymarket.com/event/" + market_slug
+    return get_event_url(market)
 
 
 # ═════════════════════════════════════════════
@@ -964,7 +985,7 @@ def process_ath(wallet, pos):
 
     return {
         "title":        get_title(pos, market),
-        "url":          get_event_url(market),
+        "url":          build_event_url(pos, market),
         "avg_entry":    avg_entry,
         "ath_price":    ath_price,
         "ath_mult":     ath_mult,
@@ -1145,7 +1166,7 @@ def process_resolution(wallet, pos):
         missed = 0.0
 
     return {
-        "title": get_title(pos, market), "url": get_event_url(market),
+        "title": get_title(pos, market), "url": build_event_url(pos, market),
         "outcome": outcome, "avg_entry": avg_entry, "shares": max_simul,
         "spent": total_spent, "max_return": max_return, "missed": missed,
     }

@@ -1,0 +1,15 @@
+# Secrets — NEVER commit the bot token
+token.txt
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime / local junk
+*.log
+bot.log
+*.BACKUP*
+*.ORIGINAL*
+chart_*.png

@@ -2,6 +2,12 @@
 token.txt
 .env
 
+# Cache database (runtime data, can get large — never commit)
+cache.db
+cache.db-journal
+cache.db-wal
+cache.db-shm
+
 # Python
 __pycache__/
 *.pyc

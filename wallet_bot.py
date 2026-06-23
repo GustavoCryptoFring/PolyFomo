@@ -12,6 +12,7 @@ import time
 import json
 import uuid
 import os
+import sqlite3
 import logging
 import threading
 import requests
@@ -163,6 +164,149 @@ def get_batch_size(total: int) -> int:
     elif total <= 1000:
         return 30
     return 50
+
+
+# ═════════════════════════════════════════════
+#  CACHE (SQLite, single file: cache.db)
+# ═════════════════════════════════════════════
+# Only wallets with more than CACHE_MIN_POSITIONS positions are cached.
+# Re-analysis recomputes ONLY positions whose fingerprint changed; resolved
+# positions whose fingerprint matches are served straight from the cache.
+# TTL is a sliding window: every access sets expiry to now + CACHE_TTL_DAYS.
+# A hard size cap evicts the least-recently-used wallets first.
+
+CACHE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+CACHE_MIN_POSITIONS = 1000
+CACHE_TTL_DAYS = 20
+CACHE_MAX_BYTES = 10 * 1024 ** 3   # 10 GB
+_cache_lock = threading.Lock()
+
+
+def cache_init():
+    """Create the cache database if it doesn't exist."""
+    try:
+        with _cache_lock:
+            con = sqlite3.connect(CACHE_DB, timeout=30)
+            # auto_vacuum=FULL so deleted rows shrink the file on disk (size cap works).
+            con.execute("PRAGMA auto_vacuum=FULL")
+            con.execute("""CREATE TABLE IF NOT EXISTS wallets(
+                wallet TEXT PRIMARY KEY, last_access INTEGER, expires_at INTEGER)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS positions(
+                wallet TEXT, mode TEXT, pos_key TEXT, fingerprint TEXT,
+                is_skip INTEGER, result_json TEXT,
+                PRIMARY KEY(wallet, mode, pos_key))""")
+            con.commit()
+            con.close()
+        log.info(f"Cache ready: {CACHE_DB} (min {CACHE_MIN_POSITIONS} pos, "
+                 f"TTL {CACHE_TTL_DAYS}d, cap {CACHE_MAX_BYTES // 1024**3}GB)")
+    except Exception as e:
+        log.error(f"cache_init failed: {e}")
+
+
+def _pos_key(p) -> str:
+    return (p.get("conditionId") or p.get("market") or "") + "|" + (p.get("asset") or "")
+
+
+def _pos_fingerprint(p) -> str:
+    # Cheap fields from the bulk positions list — catch buys, sells, resolution.
+    return f"{p.get('totalBought')}|{p.get('size')}|{p.get('realizedPnl')}|{p.get('outcome')}"
+
+
+def _pos_resolved(p) -> bool:
+    # Market settled → result is final and safe to cache forever.
+    cp = float(p.get("curPrice") or 0)
+    return cp <= 0.05 or cp >= 0.95
+
+
+def cache_load(wallet: str, mode: str) -> dict:
+    """Return {pos_key: (fingerprint, is_skip, result_dict_or_None)} for this wallet+mode."""
+    out = {}
+    try:
+        with _cache_lock:
+            con = sqlite3.connect(CACHE_DB, timeout=30)
+            cur = con.execute(
+                "SELECT pos_key, fingerprint, is_skip, result_json FROM positions "
+                "WHERE wallet=? AND mode=?", (wallet, mode))
+            for pk, fp, skip, rj in cur.fetchall():
+                out[pk] = (fp, bool(skip), json.loads(rj) if rj else None)
+            con.close()
+    except Exception as e:
+        log.error(f"cache_load failed: {e}")
+    return out
+
+
+def cache_store(wallet: str, mode: str, rows: list):
+    """Upsert position rows, refresh the wallet's sliding TTL, evict expired + over-cap.
+    rows = list of (pos_key, fingerprint, is_skip_bool, result_dict_or_None)."""
+    now = int(time.time())
+    exp = now + CACHE_TTL_DAYS * 86400
+    try:
+        with _cache_lock:
+            con = sqlite3.connect(CACHE_DB, timeout=30)
+            if rows:
+                con.executemany(
+                    "INSERT OR REPLACE INTO positions(wallet,mode,pos_key,fingerprint,is_skip,result_json) "
+                    "VALUES(?,?,?,?,?,?)",
+                    [(wallet, mode, pk, fp, 1 if skip else 0, json.dumps(r) if r else None)
+                     for (pk, fp, skip, r) in rows])
+            # sliding TTL — every access resets expiry to now + TTL
+            con.execute("INSERT OR REPLACE INTO wallets(wallet,last_access,expires_at) VALUES(?,?,?)",
+                        (wallet, now, exp))
+            # drop expired wallets
+            dead = [w[0] for w in con.execute("SELECT wallet FROM wallets WHERE expires_at < ?", (now,)).fetchall()]
+            for w in dead:
+                con.execute("DELETE FROM positions WHERE wallet=?", (w,))
+                con.execute("DELETE FROM wallets WHERE wallet=?", (w,))
+            con.commit()
+            # enforce hard size cap — evict least-recently-used wallets first
+            try:
+                if os.path.getsize(CACHE_DB) > CACHE_MAX_BYTES:
+                    order = [w[0] for w in con.execute(
+                        "SELECT wallet FROM wallets ORDER BY last_access ASC").fetchall()]
+                    for w in order:
+                        if w == wallet:
+                            continue  # never evict the wallet we just analyzed
+                        con.execute("DELETE FROM positions WHERE wallet=?", (w,))
+                        con.execute("DELETE FROM wallets WHERE wallet=?", (w,))
+                        con.commit()
+                        if os.path.getsize(CACHE_DB) <= CACHE_MAX_BYTES * 0.9:
+                            break
+            except Exception as e:
+                log.error(f"cache size enforce failed: {e}")
+            con.close()
+    except Exception as e:
+        log.error(f"cache_store failed: {e}")
+
+
+def cache_split(wallet: str, mode: str, positions: list):
+    """Split positions into (reused_results, to_compute) using the cache.
+    Returns (reused_results, to_compute, use_cache)."""
+    use_cache = len(positions) > CACHE_MIN_POSITIONS
+    if not use_cache:
+        return [], list(positions), False
+    cached = cache_load(wallet, mode)
+    reused, to_compute = [], []
+    for p in positions:
+        row = cached.get(_pos_key(p))
+        if row and row[0] == _pos_fingerprint(p) and _pos_resolved(p):
+            fp, is_skip, res = row
+            if not is_skip and res:
+                reused.append(res)
+            # a cached skip contributes nothing — and costs no API call
+        else:
+            to_compute.append(p)
+    return reused, to_compute, True
+
+
+def cache_collect_rows(to_compute: list, outcomes: dict) -> list:
+    """Build cache rows for the freshly computed positions — only the resolved (final) ones.
+    outcomes = {pos_key: result_dict_or_None}."""
+    rows = []
+    for p in to_compute:
+        if _pos_resolved(p):
+            r = outcomes.get(_pos_key(p))
+            rows.append((_pos_key(p), _pos_fingerprint(p), r is None, r))
+    return rows
 
 
 # ═════════════════════════════════════════════
@@ -1064,11 +1208,33 @@ def analyze_ath(wallet, chat_id):
 
         positions = filter_hedged(positions)
         total = len(positions)
-        send_message(chat_id, f"📊 Found {total} positions. Analyzing ATH...")
 
-        results = run_with_progress(chat_id, positions, lambda p: process_ath(wallet, p), "Analyzing")
+        # Cache: reuse resolved positions whose fingerprint is unchanged, compute the rest.
+        reused_results, to_compute, use_cache = cache_split(wallet, "ath", positions)
+        if use_cache:
+            send_message(chat_id, f"📊 Found {total} positions. {total - len(to_compute)} from cache, "
+                                  f"analyzing {len(to_compute)} new/changed...")
+        else:
+            send_message(chat_id, f"📊 Found {total} positions. Analyzing ATH...")
 
-        log.info(f"ATH analysis done: {len(results)} results")
+        outcomes = {}
+        oc_lock = threading.Lock()
+
+        def ath_worker(pos):
+            r = process_ath(wallet, pos)
+            with oc_lock:
+                outcomes[_pos_key(pos)] = r
+            return r
+
+        fresh = run_with_progress(chat_id, to_compute, ath_worker, "Analyzing") if to_compute else []
+
+        if use_cache:
+            cache_store(wallet, "ath", cache_collect_rows(to_compute, outcomes))
+
+        results = reused_results + fresh
+
+        log.info(f"ATH analysis done: {len(results)} results "
+                 f"({len(reused_results)} cached, {len(fresh)} fresh)")
 
         if not results:
             send_message(chat_id, "❌ No missed profit found.")
@@ -1227,26 +1393,34 @@ def analyze_resolution(wallet, chat_id):
 
         positions = filter_hedged(positions)
         total = len(positions)
-        send_message(chat_id, f"📊 Found {total} positions. Checking resolutions...")
 
-        won_count = {"val": 0}
-        lost_count = {"val": 0}
-        counts_lock = threading.Lock()
+        # Cache: reuse resolved positions whose fingerprint is unchanged, compute the rest.
+        reused_results, to_compute, use_cache = cache_split(wallet, "res", positions)
+        if use_cache:
+            send_message(chat_id, f"📊 Found {total} positions. {total - len(to_compute)} from cache, "
+                                  f"checking {len(to_compute)} new/changed...")
+        else:
+            send_message(chat_id, f"📊 Found {total} positions. Checking resolutions...")
 
-        def worker(pos):
+        outcomes = {}
+        oc_lock = threading.Lock()
+
+        def res_worker(pos):
             r = process_resolution(wallet, pos)
-            if r:
-                with counts_lock:
-                    if r["outcome"] == "WON":
-                        won_count["val"] += 1
-                    elif r["outcome"] == "LOST":
-                        lost_count["val"] += 1
+            with oc_lock:
+                outcomes[_pos_key(pos)] = r
             return r
 
-        results = run_with_progress(chat_id, positions, worker, "Analyzing")
+        fresh = run_with_progress(chat_id, to_compute, res_worker, "Analyzing") if to_compute else []
 
+        if use_cache:
+            cache_store(wallet, "res", cache_collect_rows(to_compute, outcomes))
+
+        results = reused_results + fresh
         won = [r for r in results if r.get("outcome") == "WON"]
         lost_list = [r for r in results if r.get("outcome") == "LOST"]
+        won_count = {"val": len(won)}
+        lost_count = {"val": len(lost_list)}
 
         if not won:
             send_message(chat_id, "❌ No winning positions with missed profit found.")
@@ -1920,6 +2094,8 @@ def main():
         log.error("❌ TELEGRAM_BOT_TOKEN is not set! Put it in token.txt next to the script, "
                   "or run: export TELEGRAM_BOT_TOKEN=\"...\"")
         return
+
+    cache_init()
 
     last_id = None
     log.info("Bot started. Polling...")
